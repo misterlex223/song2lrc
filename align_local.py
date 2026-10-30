@@ -327,13 +327,26 @@ def transcribe_chunked(model, audio, language, hint,
                 junk.append((a, min(b, keep_until)))
                 print(f"  · 丟棄幻覺 {a:6.1f}–{b:6.1f}s（{reason}）：{g['text'][:40]!r}")
                 continue
+            # 跨過 keep_until 的詞會被夾到邊界上，整串變成 start == end
+            # 的「零時長詞」。留著它們的代價很大：attach 是單向推進的，
+            # 一旦某一行配到這些垃圾詞，游標就推進過頭，下一段（重疊區
+            # 裡那份時間戳正確的拷貝）反而被跳過，接連好幾行擠在同一個
+            # 0.2 秒的區間裡。實測 Draw-the-Line 有 3 行全部擠在
+            # 234.00–234.20s。所以直接丟掉，讓下一段從頭抓。
+            words2 = []
+            for w in g["words"]:
+                ws = min(w["start"] + s0, keep_until)
+                we = min(w["end"] + s0, keep_until)
+                if we - ws < 0.01:      # 被邊界夾成零時長 → 丟
+                    continue
+                words2.append({"w": w["w"], "start": round(ws, 3),
+                               "end": round(we, 3)})
+            if not words2:              # 整段都在邊界外 → 交給下一段
+                continue
             g2 = dict(g)
-            g2["start"] = round(a, 3)
-            g2["end"] = round(min(b, keep_until), 3)
-            g2["words"] = [{"w": w["w"],
-                            "start": round(min(w["start"] + s0, keep_until), 3),
-                            "end": round(min(w["end"] + s0, keep_until), 3)}
-                           for w in g["words"]]
+            g2["start"] = round(words2[0]["start"], 3)
+            g2["end"] = round(words2[-1]["end"], 3)
+            g2["words"] = words2
             segs.append(g2)
             kept += 1
         print(f"  · {s0:6.1f}–{s1:6.1f}s → 抓到 {len(got)} 段，保留 {kept} 段")
