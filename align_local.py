@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 
 PUNCT = re.compile(r"[\s　,.\-—…!?;:'\"“”‘’()\[\]（）【】《》~～]+")
 TARGET_SR = 16000
@@ -84,19 +85,38 @@ def norm(s: str) -> str:
     return PUNCT.sub("", s).lower()
 
 
-def read_lyrics(path: str):
-    raw_lines, clean_lines = [], []
+def read_lyrics_sec(path: str):
+    """
+    讀歌詞，額外回傳每一行屬於第幾個「段」。
+
+    段 = 空行分隔的區塊（主歌／副歌／橋段）。這是歌詞檔本来就有的結構，
+    不用另外偵測，而且是粗對位現成的錨點——見 coarse_bounds()。
+    """
+    raw_lines, clean_lines, sec_ids = [], [], []
+    k, prev_blank = -1, True
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             s = raw.strip()
-            if not s or s.startswith("#"):
+            if not s:
+                prev_blank = True
                 continue
+            if s.startswith("#"):
+                continue
+            if prev_blank:
+                k += 1
+                prev_blank = False
             c = PUNCT.sub("", s)
             if not c:
                 continue
             raw_lines.append(s)
             clean_lines.append(c)
-    return raw_lines, clean_lines
+            sec_ids.append(k)
+    return raw_lines, clean_lines, sec_ids
+
+
+def read_lyrics(path: str):
+    raw, clean, _ = read_lyrics_sec(path)
+    return raw, clean
 
 
 def duration_of(path: str):
@@ -474,8 +494,186 @@ def _match_line(clean, asr_chars, wpos, words, p_word, deadline,
     return best
 
 
+NEG = -1e9
+
+
+def sec_score(sec_toks, asr_toks, j, win_mul=2.0, pad=8):
+    """
+    段放在 ASR 第 j 個詞開始位置的匹配分數（詞級 F1，失敗則退化字元級）。
+
+    用詞級而不是純字元級：段短的時候，字元級光靠字母重合就能湊到 30~40%，
+    完全沒有鑑別力（實測一堆段因此全擠在同一個位置）。
+    用 F1 而不是 recall：視窗比段長，recall 會被「視窗裡剛好有這幾個詞」
+    灌水，F1 同時看精確度。
+    詞級完全對不上時退化到字元級：Whisper 常把 "Lets go" 併成一個詞
+    "letsgo"，詞級就一個也對不上（實測 Wild Little Detours 段 13 因此
+    整段無解，連帶整個 DP 走不通）。
+    """
+    n = len(sec_toks)
+    win = asr_toks[j:j + int(n * win_mul) + pad]
+    if len(win) < n * 0.6:
+        return NEG
+    sm = difflib.SequenceMatcher(None, sec_toks, win, autojunk=False)
+    matched = sum(b.size for b in sm.get_matching_blocks())
+    if matched > 1:
+        return 2.0 * matched / (n + len(win))
+    sc, sw = "".join(sec_toks), "".join(win)
+    if not sc or not sw:
+        return NEG
+    m2 = sum(b.size for b in difflib.SequenceMatcher(
+        None, sc, sw, autojunk=False).get_matching_blocks())
+    if not m2:
+        return NEG
+    return 0.8 * 2.0 * m2 / (len(sc) + len(sw))   # 打折：字元級證據較弱
+
+
+def coarse_anchors(sec_toks_list, asr_toks, win_mul=2.0, pad=8,
+                   gap_ratio=None, slack=1.0):
+    """
+    粗對位：全域 DP 把 ASR 詞序列切成 N 段，第 i 段放第 i 個歌詞段。
+
+    為什麼粗對位要跟行級用不同演算法：
+      行級 = 逐行貪婪推進（earliest + 時間上限），便宜，但一行配錯後面
+             全部鎖死，只能用 --max-gap 這種補丁去擋，本質上是在猜。
+      段級 = 全域 DP 求單調最優分割，貴（O(段數 × 詞數)），但不會級聯，
+             而且段長、獨特，重複副歌誘不走。
+
+    段把時間窗定下來之後，行級只在窗內跑，級聯就被關進籠子裡——
+    最壞情況是一個段內錯，不會擴散到全曲。
+
+    回傳 list：每個段在 ASR 裡的起始詞 index；無解回傳 []。
+    """
+    n_sec, W = len(sec_toks_list), len(asr_toks)
+    if not n_sec or not W:
+        return []
+    # slack=1.0 最準（實測偏移中位 3~4 詞），但那剛好是把 ASR 詞數用滿，
+    # 遇到 ASR 比歌詞短的情況就塞不下。無解時逐步放寬重試。
+    for s in (slack, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4):
+        got = _coarse_dp(sec_toks_list, asr_toks, win_mul, pad, gap_ratio, s)
+        if got:
+            return got
+    return []
+
+
+def _coarse_dp(sec_toks_list, asr_toks, win_mul, pad, gap_ratio, slack):
+    n_sec, W = len(sec_toks_list), len(asr_toks)
+    score = []
+    for toks in sec_toks_list:
+        row = [sec_score(toks, asr_toks, j, win_mul, pad) for j in range(W)]
+        if max(row) <= NEG / 2:
+            # 整段都找不到證據（例如 ASR 完全沒聽到這段）：設成 0 分，
+            # 讓它不貢獻也不阻斷 DP，位置交給前後段的單調約束去決定。
+            row = [0.0] * W
+        score.append(row)
+
+    # 段至少要佔這麼多詞，才不會兩段擠在一起。
+    #
+    # 這個下界非常關鍵，而且不能拍腦袋設成常數：Whisper 吐的詞通常比歌詞
+    # 多（會加字、重複、把 "Lets go" 併成 "letsgo" 或拆成兩個），所以
+    # 「歌詞 N 個詞」在 ASR 裡實際佔的位置是 N × (ASR總詞數/歌詞總詞數)。
+    # 實測用固定的 0.6 倍會讓每段都被往前擠，誤差沿段累積到第 10 段已經
+    # 偏了 38 個詞（約 20 秒）。slack 保留一點彈性給間奏和漏聽。
+    total = sum(len(t) for t in sec_toks_list) or 1
+    ratio = gap_ratio if gap_ratio else (W / total)
+    est = [max(int(len(t) * ratio * slack), 1) for t in sec_toks_list]
+    dp = [[NEG] * W for _ in range(n_sec)]
+    back = [[-1] * W for _ in range(n_sec)]
+    dp[0] = score[0][:]                      # 第一段可以從任何地方開始
+    for i in range(1, n_sec):
+        # best[j] = max(dp[i-1][j'] for j' <= j - est[i-1])，用 prefix max
+        best, bestj, run, runj = NEG, -1, NEG, -1
+        for j in range(W):
+            src = j - est[i - 1]
+            if src >= 0 and dp[i - 1][src] > run:
+                run, runj = dp[i - 1][src], src
+            if run > best:
+                best, bestj = run, runj
+            if score[i][j] > NEG / 2:
+                dp[i][j] = best + score[i][j]
+                back[i][j] = bestj
+
+    end = max(range(W), key=lambda j: dp[n_sec - 1][j])
+    if dp[n_sec - 1][end] <= NEG / 2:
+        return []
+    out = [0] * n_sec
+    j = end
+    for i in range(n_sec - 1, 0, -1):
+        out[i] = j
+        j = back[i][j]
+        if j < 0:
+            return []
+    out[0] = j
+    return out
+
+
+def coarse_bounds(sec_ids, raw_lines, asr_toks, margin=3, min_block=0,
+                  verbose=False, words=None, **kw):
+    """
+    粗對位的產出：每一行的搜尋詞範圍 [(lo, hi), ...]。
+
+    margin 是給塊邊界的寬容（詞數）——DP 的塊長度是估計的，
+    切得太死會把正確的配對擋在門外。
+
+    min_block>0 時會先把連續的小段併成「塊」再定位。這通常比較好：
+    歌詞的空行常常切得太細（很多段只有兩行），短段的錨點不穩，
+    窗也因此窄到會誤傷；併成幾十個詞的大塊之後，錨點更準、窗更寬，
+    卻一樣能擋住跨塊的級聯。
+    """
+    n_sec = max(sec_ids) + 1 if sec_ids else 0
+    if n_sec <= 1:
+        return None
+    sec_toks = [[] for _ in range(n_sec)]
+    for i, s in enumerate(sec_ids):
+        for t in raw_lines[i].split():
+            if any(ch.isalnum() for ch in t):
+                sec_toks[s].append(norm(t))
+
+    if min_block > 0:                       # 併段：記錄塊 → 包含哪些段
+        groups, cur = [], []
+        for si in range(n_sec):
+            cur.append(si)
+            if sum(len(sec_toks[x]) for x in cur) >= min_block:
+                groups.append(cur)
+                cur = []
+        if cur:
+            if groups and len(sec_toks) and \
+                    sum(len(sec_toks[x]) for x in cur) < min_block // 2:
+                groups[-1].extend(cur)      # 剩下的太少就併進上一塊
+            else:
+                groups.append(cur)
+        blk_toks = []
+        for g in groups:
+            t = []
+            for si in g:
+                t.extend(sec_toks[si])
+            blk_toks.append(t)
+        sec_of_blk = {si: bi for bi, g in enumerate(groups) for si in g}
+    else:
+        blk_toks = sec_toks
+        sec_of_blk = {si: si for si in range(n_sec)}
+
+    anchors = coarse_anchors(blk_toks, asr_toks, **kw)
+    if len(anchors) != len(blk_toks):
+        return None
+    if verbose:
+        def tt(i):
+            return f"{words[i]['start']:6.1f}s" if words and i < len(words) \
+                else f"詞{i}"
+        print("       塊錨點：" + "  ".join(
+            f"{tt(a)}" for a in anchors[:12])
+            + ("  …" if len(anchors) > 12 else ""))
+    W = len(asr_toks)
+    bounds = []
+    for si in sec_ids:
+        bi = sec_of_blk[si]
+        lo = max(anchors[bi] - margin, 0)
+        hi = min((anchors[bi + 1] if bi + 1 < len(anchors) else W) + margin, W)
+        bounds.append((lo, max(hi, lo + 1)))
+    return bounds
+
+
 def attach(raw_lines, lyrics_clean, segs, min_cover=0.4, lookahead=120,
-           max_gap=30.0, earliest=True):
+           max_gap=30.0, earliest=True, bounds=None):
     """
     依序錨定映射：把 ASR 詞攤平成一個字串，然後**依照歌詞行的順序**
     往後找每一行最可能的位置，找到就把游標推進到該處之後。
@@ -493,14 +691,33 @@ def attach(raw_lines, lyrics_clean, segs, min_cover=0.4, lookahead=120,
     n_words = len(words)
 
     out, p, anchor = [], 0, 0.0
-    for raw, clean in zip(raw_lines, lyrics_clean):
+    for i, (raw, clean) in enumerate(zip(raw_lines, lyrics_clean)):
         hit = None
         if clean and asr_chars:
-            best = _match_line(clean, asr_chars, wpos, words, p,
-                               anchor + max_gap, lookahead, n_words,
-                               min_cover=min_cover, earliest=earliest)
-            if best and best[0] >= min_cover:
-                hit = best
+            # 粗對位給的窗：游標要「夾」在窗內，不是「至少」在窗內。
+            #
+            # 這裡的細節決定成敗。兩種失敗的寫法都實測過：
+            #   · 純軟約束（窗內找不到就退回全文）→ 完全沒作用。24 組參數
+            #     測試裡插值行數一模一樣，因為級聯發生時游標 p 早就跑出窗
+            #     外了，退回全文只是讓級聯繼續。
+            #   · 硬下界（p0 = max(p, lo)）→ 健康度 90 → 52。只要有一行
+            #     配到窗外，p 就推進過頭，後面每行的下界都被抬高，全首崩。
+            # 正確做法是把 p 夾回窗內：級聯因此被限制在單一段裡，
+            # 進到下一段時游標會被拉回正確的範圍。窗內真的找不到才退回全文。
+            if bounds:
+                lo, hi = bounds[i]
+                p0 = min(max(p, lo), max(hi - 1, lo))
+                best = _match_line(clean, asr_chars, wpos, words, p0,
+                                   anchor + max_gap, lookahead, hi,
+                                   min_cover=min_cover, earliest=earliest)
+                if best and best[0] >= min_cover:
+                    hit = best
+            if not hit:
+                best = _match_line(clean, asr_chars, wpos, words, p,
+                                   anchor + max_gap, lookahead, n_words,
+                                   min_cover=min_cover, earliest=earliest)
+                if best and best[0] >= min_cover:
+                    hit = best
         if hit:
             _, lo, hi = hit
             wi_lo = asr_char_owner[lo]
@@ -520,8 +737,21 @@ def attach(raw_lines, lyrics_clean, segs, min_cover=0.4, lookahead=120,
     return out
 
 
-def _spread(line_text, s, e, span):
-    """把行的時間區間按字數比例分給歌詞裡的每個詞"""
+def _spread(line_text, s, e, span, fine=True):
+    """
+    細對位：把行的時間分給歌詞裡的每個詞（逐字版 LRC 用）。
+
+    兩條路：
+      · 詞級比對（fine=True）：拿歌詞的詞跟 ASR 的詞做序列比對，命中的
+        直接用 Whisper 給的真實時間戳，只有沒命中的才用前後鄰居補。
+        實測 74~88% 的詞能拿到真實時間戳，相較於純比例分配，詞級誤差
+        90 分位 0.11~0.67s、最大 1.16s。
+      · 字數比例（fallback）：詞級完全對不上時（例如整行只有一個 ASR 詞
+        涵蓋）退回原本的按比例切。
+
+    注意這層只影響逐字版的詞時間戳，行級的 start/end 不受影響——
+    實測行級誤差已經是 0.00s，細對位在行級一點用都沒有。
+    """
     toks = line_text.split()
     if not toks:
         return []
@@ -529,13 +759,49 @@ def _spread(line_text, s, e, span):
     if len(span) == len(toks):
         return [{"w": t, "start": span[i]["start"], "end": span[i]["end"]}
                 for i, t in enumerate(toks)]
-    total = sum(len(t) for t in toks) or 1
-    dur = max(e - s, 0.1)
-    out, cur = [], s
-    for t in toks:
-        w = dur * len(t) / total
-        out.append({"w": t, "start": round(cur, 3), "end": round(cur + w, 3)})
-        cur += w
+
+    got = {}
+    if fine and len(span) >= 2:
+        nt = [norm(t) for t in toks]
+        ns = [norm(w["w"]) for w in span]
+        sm = difflib.SequenceMatcher(None, nt, ns, autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for k in range(i2 - i1):
+                    got[i1 + k] = (span[j1 + k]["start"], span[j1 + k]["end"])
+
+    if not got:                             # 詞級沒對上 → 退回字數比例
+        total = sum(len(t) for t in toks) or 1
+        dur = max(e - s, 0.1)
+        out, cur = [], s
+        for t in toks:
+            w = dur * len(t) / total
+            out.append({"w": t, "start": round(cur, 3),
+                        "end": round(cur + w, 3)})
+            cur += w
+        return out
+
+    out = []
+    for i, t in enumerate(toks):
+        if i in got:
+            a, b = got[i]
+        else:                               # 沒命中的詞：夾在鄰居之間
+            prev = next((o for o in reversed(out[:i])
+                         if o["start"] is not None), None)
+            a = prev["end"] if prev else s
+            nxt = next((got[j][0] for j in range(i + 1, len(toks))
+                        if j in got), None)
+            b = nxt if nxt else e
+            if b <= a:
+                b = a + 0.05
+        out.append({"w": t, "start": round(a, 3), "end": round(b, 3)})
+
+    # 保證單調遞增，否則逐字版會出現時間倒流
+    for i in range(1, len(out)):
+        if out[i]["start"] < out[i - 1]["end"]:
+            out[i]["start"] = out[i - 1]["end"]
+        if out[i]["end"] <= out[i]["start"]:
+            out[i]["end"] = out[i]["start"] + 0.05
     return out
 
 
@@ -608,13 +874,26 @@ def main():
     p.add_argument("--max-gap", type=float, default=30.0,
                    help="每一行最多只能配到「上一行結束 + 這個秒數」之前。"
                         "太大會被相似歌詞誘走，太小會穿不過長間奏")
+    p.add_argument("--coarse", default="off", choices=["off", "section"],
+                   help="粗對位：先用「段」做全域 DP 錨定，再讓行級在窗內跑。"
+                        "段長又獨特，抗錯能力遠高於單行，而且能級聯錯誤關在"
+                        "單一段內。off = 只用行級（舊行為）")
+    p.add_argument("--coarse-margin", type=int, default=3,
+                   help="段邊界的前後寬容（詞數）。DP 的段長度是估計的，"
+                        "切太死會把正確配對擋在門外")
+    p.add_argument("--coarse-block", type=int, default=0,
+                   help="粗對位的粒度：先把連續的小段併成至少這麼多詞的"
+                        "「塊」再定位（0 = 不併，直接用歌詞的空行分段）。"
+                        "併大塊通常比較穩，見 coarse_bounds() 的說明")
     args = p.parse_args()
 
-    raw_lines, clean_lines = read_lyrics(args.lyrics)
+    raw_lines, clean_lines, sec_ids = read_lyrics_sec(args.lyrics)
     if not clean_lines:
         raise SystemExit("歌詞是空的。")
+    n_sec = (max(sec_ids) + 1) if sec_ids else 0
     print(f"[音訊] {os.path.basename(args.audio)}")
-    print(f"[歌詞] {len(clean_lines)} 行 / {sum(len(c) for c in clean_lines)} 字")
+    print(f"[歌詞] {len(clean_lines)} 行 / {sum(len(c) for c in clean_lines)} 字"
+          f" / {n_sec} 段（空行分隔）")
 
     segs_path = args.segs_out or os.path.splitext(args.output)[0] + ".segs.json"
 
@@ -667,9 +946,24 @@ def main():
     except OSError:
         pass
 
+    bounds = None
+    if args.coarse == "section":
+        asr_toks = [norm(w["w"]) for s in segs for w in (s.get("words") or [])]
+        t0 = time.time()
+        bounds = coarse_bounds(sec_ids, raw_lines, asr_toks,
+                               margin=args.coarse_margin,
+                               min_block=args.coarse_block, verbose=True,
+                               words=[w for s in segs for w in (s.get("words") or [])])
+        if bounds:
+            print(f"[粗對位] {n_sec} 段全域 DP 完成（{time.time() - t0:.1f}s），"
+                  f"行級搜尋已限制在各段的時間窗內")
+        else:
+            print(f"[粗對位] 失敗（段數不足或 ASR 太短），退回純行級")
+
     mapped = attach(raw_lines, clean_lines, segs,
                     min_cover=args.min_cover, lookahead=args.lookahead,
-                    max_gap=args.max_gap, earliest=not args.prefer_best)
+                    max_gap=args.max_gap, earliest=not args.prefer_best,
+                    bounds=bounds)
 
     lines = [{
         "text": m["text"],
