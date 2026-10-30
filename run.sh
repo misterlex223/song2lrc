@@ -32,6 +32,8 @@ mkdir -p "$OUT"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 MODEL="${MODEL:-small}"                  # tiny / base / small / medium
 LANG_CODE="${5:-${LANG_CODE:-zh}}"       # zh / en / yue，也可用第 5 個參數指定
+CHUNK="${CHUNK:-60}"                     # 分段秒數；插值率偏高時試 30
+NST="${NST:-0.85}"                       # no_speech_threshold；越大越不容易跳段
 
 # 注意：bash 3.2 在 UTF-8 環境下會把緊跟在 $VAR 後面的全形字元
 # 當成變數名稱的一部分，所以變數一律用 ${...} 包起來。
@@ -45,6 +47,7 @@ else
   echo "       350 秒的歌在 CPU 上約需 17 分鐘，去泡杯咖啡"
   .venv/bin/python align_local.py "$AUDIO" "$LYRICS" \
     -o "$OUT/${BASE}.words.json" --model "$MODEL" --language "$LANG_CODE" \
+    --chunk "$CHUNK" --no-speech-threshold "$NST" \
     2>&1 | tee "$OUT/align.log"
 fi
 
