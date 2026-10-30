@@ -28,6 +28,57 @@ import sys
 PUNCT = re.compile(r"[\s　,.\-—…!?;:'\"“”‘’()\[\]（）【】《》~～]+")
 TARGET_SR = 16000
 
+# ---------------------------------------------------------------------------
+# Whisper 幻覺黑名單
+#
+# Whisper 是在大量 YouTube 字幕 / 影片音軌上訓練的。餵它一段沒聽懂的音樂，
+# 它不會回傳空白，而是很自信地吐出訓練語料裡最常見的句子：
+# "Thanks for watching." / "I hope you enjoyed the video." / "www.xxx.com"。
+# 這些假段落會搶走真實歌詞的時間軸——實測 Wild Little Detours 就被
+# 一句 "Thanks for watching." 佔掉 8.4~26.0s，害主歌一整段全變插值。
+#
+# 兩道關卡：
+#   1) 片語黑名單（下面這條 regex）
+#   2) 稀疏檢查：很長的段落卻只有幾個字，正常唱歌不會這樣
+# 命中就整段丟掉，並把那段时间拿去用更小的切片重轉一次，嘗試撈回真歌詞。
+# ---------------------------------------------------------------------------
+HALLUCINATION = re.compile(
+    r"thanks?(?:\s*you)?\s*(?:for\s*)?(?:watching|listening"
+    r"|your\s*(?:time|support))"
+    r"|(?:谢谢|感謝|感谢)\s*(?:观看|收看|收聽|聆听)"
+    r"|i\s*hope\s*you\s*(?:enjoyed|enjoy|liked|like)"
+    r"|(?:see|talk\s*to)\s*you\s*(?:in|on|next|soon|later)"
+    r"|please\s*(?:subscribe|like|share|comment)"
+    r"|(?:like\s*and\s*)?subscribe(?:\s*to\s*(?:my|our|the)\s*channel)?"
+    r"|don'?t\s*forget\s*to\s*(?:subscribe|like)"
+    r"|www\s*\.|https?\s*://|\.(?:com|net|org)\b"
+    r"|subtitles?\s*(?:by|provided)"
+    r"|(?:字幕|字幕\s*由|字幕\s*提供|字幕菌|字幕组|字幕組)"
+    r"|(?:请不吝点赞|订阅|轉發|打赏|明けまして)"
+    r"|(?:translated|transcription)\s*by"
+    r"|amara\s*\.?\s*org"
+    r"|music\s*(?:by|from)\s*copyright"
+    r"|all\s*rights\s*reserved"
+    , re.I)
+
+
+def is_hallucination(seg):
+    """回傳 None（正常）或一個說明字串（該丟掉）"""
+    t = (seg.get("text") or "").strip()
+    if not t:
+        return "空白"
+    if HALLUCINATION.search(t):
+        return "片語黑名單"
+    # 注意：不能用「文字出現在 initial_prompt 裡」來判斷回音。
+    # initial_prompt 就是歌詞本身，凡是轉寫正確的句子都必然是它的子字串，
+    # 一開就連開場對白 "Ready? / You know the way?" 都被誤殺（健康度反而下降）。
+    # 回音只能靠片語黑名單（例如 "Youknowthewayofcourse.com"）去擋。
+    dur = float(seg["end"]) - float(seg["start"])
+    n = len(norm(t))
+    if dur >= 12.0 and n / dur < 1.0:
+        return f"稀疏（{dur:.1f}s 只有 {n} 字）"
+    return None
+
 
 def norm(s: str) -> str:
     return PUNCT.sub("", s).lower()
@@ -124,7 +175,7 @@ def _transcribe_one(model, clip, language, hint, nst):
         clip,
         language=language,
         word_timestamps=True,
-        initial_prompt=hint,
+        initial_prompt=(hint or None),
         vad_filter=False,             # Silero 對音樂完全失效，見 README
         condition_on_previous_text=False,   # 音樂上容易讓幻覺一路連鎖下去
         no_speech_threshold=nst,
@@ -142,8 +193,83 @@ def _transcribe_one(model, clip, language, hint, nst):
     return out
 
 
+def _shift(seg, off, cap=None):
+    """把段落（含字級）時間軸平移 off 秒，並可裁到 cap 為止"""
+    g = dict(seg)
+    g["start"] = round(seg["start"] + off, 3)
+    g["end"] = round(seg["end"] + off, 3)
+    if cap is not None:
+        g["start"] = min(g["start"], cap)
+        g["end"] = min(g["end"], cap)
+    g["words"] = [{"w": w["w"],
+                   "start": round(w["start"] + off, 3),
+                   "end": round(w["end"] + off, 3)}
+                  for w in seg["words"]]
+    if cap is not None:
+        g["words"] = [w for w in g["words"] if w["start"] < cap]
+        for w in g["words"]:
+            w["end"] = min(w["end"], cap)
+    return g
+
+
+def _merge_no_overlap(base, extra):
+    """合併兩批段落，重疊時保留詞數較多（資訊量較大）的那一段"""
+    out = []
+    for s in sorted(base + extra, key=lambda x: (x["start"], x["end"])):
+        if out and s["start"] < out[-1]["end"] - 0.25:
+            if len(s["words"]) > len(out[-1]["words"]):
+                out[-1] = s
+            continue
+        out.append(s)
+    return out
+
+
+def _gap_ranges(segs, min_gap, total=None):
+    """
+    找出沒有被任何段落覆蓋到的時間洞：段落之間、第一段之前、最後一段之後。
+    這比「整段都沒輸出」更能抓到真正的漏聽：實測 Wild Little Detours
+    的主歌一就是被夾在 6.2s 與 34.3s 兩個段落之間、長達 28 秒的洞，
+    整段 Whisper 靜默，但切成 4 秒一片就聽得出 "Morning sun and open road"。
+    """
+    if min_gap <= 0 or not segs:
+        return []
+    out = []
+    if total is not None and segs[0]["start"] >= min_gap:
+        out.append([0.0, segs[0]["start"]])
+    reach = segs[0]["end"]
+    for s in segs[1:]:
+        if s["start"] - reach >= min_gap:
+            out.append([reach, s["start"]])
+        reach = max(reach, s["end"])
+    if total is not None and total - reach >= min_gap:
+        out.append([reach, total])
+    return out
+
+
+def recover_range(model, audio, a, b, language, hint, nst, sub=8.0):
+    """
+    幻覺通常長在「長而含糊」的音訊上。切成 8 秒的小片各自獨立解碼，
+    解碼狀態短、不容易再觸發同一句幻覺，常常就能把真歌詞撈回來。
+    """
+    total = len(audio) / TARGET_SR
+    b = min(b, total)
+    out, s = [], a
+    while s < b - 0.5:
+        e = min(s + sub, b)
+        clip = audio[int(s * TARGET_SR):int(e * TARGET_SR)]
+        if len(clip) < int(TARGET_SR * 0.5):
+            break
+        for g in _transcribe_one(model, clip, language, hint, nst):
+            if is_hallucination(g):
+                continue
+            out.append(_shift(g, s, cap=b))
+        s = e
+    return out
+
+
 def transcribe_chunked(model, audio, language, hint,
-                       chunk=60.0, overlap=4.0, nst=0.85):
+                       chunk=60.0, overlap=4.0, nst=0.85,
+                       retry=8.0, gap=8.0, filter_junk=True):
     """
     分段轉寫。
 
@@ -157,9 +283,15 @@ def transcribe_chunked(model, audio, language, hint,
     """
     total = len(audio) / TARGET_SR
     if total <= chunk * 1.5:
-        return _transcribe_one(model, audio, language, hint, nst)
+        got = _transcribe_one(model, audio, language, hint, nst)
+        if not filter_junk:
+            return got
+        good = [g for g in got if not is_hallucination(g)]
+        junk = [(g["start"], g["end"]) for g in got if is_hallucination(g)]
+        return _retry_ranges(model, audio, good, junk, language, hint,
+                             nst, retry, gap, total)
 
-    segs, s0 = [], 0.0
+    segs, s0, junk = [], 0.0, []
     while s0 < total:
         s1 = min(s0 + chunk, total)
         clip = audio[int(s0 * TARGET_SR):int(s1 * TARGET_SR)]
@@ -169,6 +301,11 @@ def transcribe_chunked(model, audio, language, hint,
         for g in got:
             a, b = g["start"] + s0, g["end"] + s0
             if a >= keep_until:            # 整段落在重疊區 → 交給下一段
+                continue
+            if filter_junk and (reason := is_hallucination(g)):
+                # 記下絕對時間，稍後用小切片重試
+                junk.append((a, min(b, keep_until)))
+                print(f"  · 丟棄幻覺 {a:6.1f}–{b:6.1f}s（{reason}）：{g['text'][:40]!r}")
                 continue
             g2 = dict(g)
             g2["start"] = round(a, 3)
@@ -185,6 +322,38 @@ def transcribe_chunked(model, audio, language, hint,
         s0 = s1 - overlap
 
     segs.sort(key=lambda x: x["start"])
+    return _retry_ranges(model, audio, segs, junk, language, hint,
+                         nst, retry, gap, total)
+
+
+def _retry_ranges(model, audio, segs, junk, language, hint,
+                  nst, retry, gap, total):
+    """
+    兩類可疑區間都用小切片重轉一次：
+      1) 命中幻覺被丟掉的段落
+      2) 段落之間的覆蓋空檔（>= gap 秒）——真正的漏聽最常躲在這裡
+    """
+    if retry <= 0:
+        return segs
+    todo = [(a, min(b, total)) for a, b in junk if b > a]
+    todo += [(a, b) for a, b in _gap_ranges(segs, gap, total) if b > a]
+    if not todo:
+        return segs
+
+    todo.sort()
+    merged = []
+    for a, b in todo:                       # 相鄰/重疊的合併成一個區間
+        if merged and a <= merged[-1][1] + 1.0:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    for a, b in merged:
+        print(f"  · 重試 {a:6.1f}–{b:6.1f}s（每 {retry:.0f}s 一片）")
+        got = recover_range(model, audio, a, b, language, hint, nst,
+                            sub=retry)
+        print(f"      撈回 {len(got)} 段"
+              + (f"：{got[0]['text'][:40]!r}" if got else ""))
+        segs = _merge_no_overlap(segs, got)
     return segs
 
 
@@ -261,72 +430,88 @@ def load_audio_16k(path, target=TARGET_SR):
     return np.ascontiguousarray(data, dtype=np.float32)
 
 
-def build_char_map(lyric_chars: str, asr_chars: str):
-    """
-    把歌詞的每個字元對應到 ASR 字串的字元索引。
-    回傳 (amap, strict)：strict[i] 表示該字元是否真的在 LCS 配對區段裡。
-    配對區段之間的字元會補一個大致的位置，但 strict=False，
-    讓上層能判斷「這行其實沒抓到」而不是硬套一個錯的時間。
-    """
-    amap = [None] * len(lyric_chars)
-    strict = [False] * len(lyric_chars)
-    sm = difflib.SequenceMatcher(None, lyric_chars, asr_chars, autojunk=False)
-    for i, j, n in sm.get_matching_blocks():
-        for k in range(n):
-            amap[i + k] = j + k
-            strict[i + k] = True
-
-    last = None
-    for i, v in enumerate(amap):
-        if v is None:
-            amap[i] = None if last is None else min(last + 1, len(asr_chars) - 1)
-        else:
-            last = v
-    first = next((v for v in amap if v is not None), None)
-    if first is not None:
-        for i, v in enumerate(amap):
-            if v is None:
-                amap[i] = max(first - (i + 1), 0)
-            else:
-                break
-    return amap, strict
+def _word_char_index(asr_parts):
+    """每個 ASR 詞在 asr_chars 裡的起始位置"""
+    idx, cur = [], 0
+    for p in asr_parts:
+        idx.append(cur)
+        cur += len(p)
+    return idx
 
 
-def attach(raw_lines, lyrics_clean, segs):
+def _match_line(clean, asr_chars, wpos, words, p_word, deadline,
+                lookahead, n_words, min_cover=0.0, earliest=False):
     """
-    字級映射：先把所有 ASR 詞攤平成字串，跟整份歌詞做序列比對，
-    再依行的邊界切回去。這樣即使 Whisper 把好幾行併成一段也能對得上。
-    若某行真正配對到的字元太少（<50%），判定為「沒抓到」，改用前後插值。
+    在 ASR 串裡、從第 p_word 個詞開始往後，找這行歌詞最可能的位置。
+    回傳 (覆蓋率, asr_chars 起, asr_chars 訖) 或 None。
+
+    兩個限制都很關鍵：
+      · 只回傳「最長連續共同區塊」的覆蓋率。若用全域 LCS 的相似度，
+        副歌重複三次時很容易把某一行配到很後面的那一次去。
+      · 搜尋不能超過 deadline（上一個對上的行 + max-gap 秒）。否則像
+        「Here we go again!」這種跟後面「Here we go tonight」只差幾個字的行，
+        會一口氣往前跳 43 秒，把中間十幾行全部鎖死在門外。
+    """
+    best, need = None, len(clean)
+    for k in range(p_word, min(p_word + lookahead, n_words)):
+        if words[k]["start"] > deadline:
+            break
+        a0 = wpos[k]
+        cand = asr_chars[a0:a0 + need * 2 + 12]
+        if not cand:
+            break
+        sm = difflib.SequenceMatcher(None, clean, cand, autojunk=False)
+        m = sm.find_longest_match(0, need, 0, len(cand))
+        cover = m.size / need
+        if cover < min_cover:
+            continue
+        if earliest:                    # 夠好就用，不貪心找更後面更完美的
+            return (cover, a0 + m.b, a0 + m.b + m.size)
+        if best is None or cover > best[0]:
+            best = (cover, a0 + m.b, a0 + m.b + m.size)
+        if cover >= 0.999:              # 完美命中，不必再往後找
+            break
+    return best
+
+
+def attach(raw_lines, lyrics_clean, segs, min_cover=0.4, lookahead=120,
+           max_gap=30.0, earliest=True):
+    """
+    依序錨定映射：把 ASR 詞攤平成一個字串，然後**依照歌詞行的順序**
+    往後找每一行最可能的位置，找到就把游標推進到該處之後。
+
+    為什麼不用整份歌詞對整份 ASR 做一次全域比對：副歌會重複好幾次，
+    全域 LCS 一旦某一行配錯（實測 "Feels a little right with you" 配到
+    第三段副歌），後面十幾行就統統沒有得配，全部掉進插值。
+    強制單向推進 + 時間上限可以保證時間軸永遠往前、也一定先用最近的一次。
     """
     words = [w for s in segs for w in s["words"]]
-    asr_char_owner, asr_parts = [], []
-    for idx, w in enumerate(words):
-        n = norm(w["w"])
-        asr_parts.append(n)
-        asr_char_owner.extend([idx] * len(n))
+    asr_parts = [norm(w["w"]) for w in words]
+    asr_char_owner = [i for i, p in enumerate(asr_parts) for _ in p]
     asr_chars = "".join(asr_parts)
+    wpos = _word_char_index(asr_parts)
+    n_words = len(words)
 
-    lyric_chars = "".join(lyrics_clean)
-    if asr_chars:
-        amap, strict = build_char_map(lyric_chars, asr_chars)
-    else:
-        amap, strict = [None] * len(lyric_chars), [False] * len(lyric_chars)
-
-    out, pos = [], 0
+    out, p, anchor = [], 0, 0.0
     for raw, clean in zip(raw_lines, lyrics_clean):
-        lo, hi = pos, pos + len(clean)
-        pos = hi
-        hit = sum(1 for k in range(lo, hi) if strict[k]) if hi > lo else 0
-        ratio = hit / len(clean) if clean else 0.0
-
-        if hi > lo and asr_chars and ratio >= 0.5 and amap[lo] is not None:
-            wi_lo = asr_char_owner[amap[lo]]
-            wi_hi = asr_char_owner[min(amap[hi - 1], len(asr_char_owner) - 1)]
+        hit = None
+        if clean and asr_chars:
+            best = _match_line(clean, asr_chars, wpos, words, p,
+                               anchor + max_gap, lookahead, n_words,
+                               min_cover=min_cover, earliest=earliest)
+            if best and best[0] >= min_cover:
+                hit = best
+        if hit:
+            _, lo, hi = hit
+            wi_lo = asr_char_owner[lo]
+            wi_hi = asr_char_owner[hi - 1]
             s = words[wi_lo]["start"]
             e = max(words[wi_hi]["end"], s + 0.2)
             out.append({"text": raw, "start": s, "end": e,
                         "words": _spread(raw, s, e, words[wi_lo:wi_hi + 1]),
                         "_note": None})
+            p = wi_hi + 1
+            anchor = max(anchor, e)
         else:
             out.append({"text": raw, "start": None, "end": None,
                         "words": [], "_note": "Whisper 沒抓到，需插值"})
@@ -395,6 +580,34 @@ def main():
     p.add_argument("--no-speech-threshold", type=float, default=0.85,
                    help="放寬到 0.85：唱歌常被判成「非語音」而被整段跳掉"
                         "（原始預設 0.6 太嚴）")
+    p.add_argument("--retry-chunk", type=float, default=8.0,
+                   help="命中幻覺的時間段，改用這個長度（秒）的小切片重轉；"
+                        "傳 0 可關閉重試")
+    p.add_argument("--gap", type=float, default=8.0,
+                   help="段落之間超過這個秒數的空檔，就用小切片重轉補洞；"
+                        "0 = 不補")
+    p.add_argument("--hint", default="",
+                   help="initial_prompt。預設留空：實測把歌詞當提示詞餵進去，"
+                        "Whisper 遇到聽不懂的音樂會直接把提示詞當回音吐出來"
+                        "（'Youknowthewayofcourse'、'Morningsunanopenroad'），"
+                        "污染序列比對。要自動帶入歌詞前幾行請傳 auto")
+    p.add_argument("--allow-junk", action="store_true",
+                   help="關閉幻覺過濾（除錯用：想看 Whisper 到底吐了什麼）")
+    p.add_argument("--segs-in", default="",
+                   help="讀取已存好的 <歌名>.segs.json 直接做映射，不重跑轉寫")
+    p.add_argument("--segs-out", default="",
+                   help="原始 ASR 段落存檔路徑（預設 <輸出>.segs.json）")
+    p.add_argument("--min-cover", type=float, default=0.4,
+                   help="一行歌詞要有多少比例的字在 ASR 裡連續命中才算對上。"
+                        "0.4 實測最穩：門檻拉高會讓轉寫跟歌詞落差大的整首崩掉")
+    p.add_argument("--prefer-best", action="store_true",
+                   help="改用「覆蓋率最高的候選」而非預設的「最早的可接受候選」。"
+                        "後者比較符合唱歌的順序性，實測插值行更少")
+    p.add_argument("--lookahead", type=int, default=120,
+                   help="每一行最多往後找幾個 ASR 詞（防止配到很遠的重複副歌）")
+    p.add_argument("--max-gap", type=float, default=30.0,
+                   help="每一行最多只能配到「上一行結束 + 這個秒數」之前。"
+                        "太大會被相似歌詞誘走，太小會穿不過長間奏")
     args = p.parse_args()
 
     raw_lines, clean_lines = read_lyrics(args.lyrics)
@@ -403,24 +616,47 @@ def main():
     print(f"[音訊] {os.path.basename(args.audio)}")
     print(f"[歌詞] {len(clean_lines)} 行 / {sum(len(c) for c in clean_lines)} 字")
 
-    from faster_whisper import WhisperModel
-    mpath = resolve_model(args.model)
-    cached = os.path.isdir(mpath)
-    print(f"[載入] faster-whisper '{args.model}'"
-          + ("（使用本機快取，不連網）" if cached else "（首次會下載模型）"))
-    model = WhisperModel(mpath, device="cpu", compute_type="int8")
+    segs_path = args.segs_out or os.path.splitext(args.output)[0] + ".segs.json"
 
-    audio = load_audio_16k(args.audio)
-    dur = len(audio) / TARGET_SR      # 用實際樣本數，不信 sf.info 的估計值
-    print(f"[解碼] {dur:.1f}s @ {TARGET_SR}Hz（已繞開 faster-whisper 的 PyAV 呼叫）")
+    if args.segs_in:
+        # 已經轉寫過，直接沿用：調 attach 的參數時不必再花十幾分鐘重聽一次
+        with open(args.segs_in, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        segs = saved["segments"]
+        dur = saved.get("duration") or (segs[-1]["end"] if segs else 0.0)
+        print(f"[沿用] {args.segs_in}（{len(segs)} 段），不做轉寫")
+    else:
+        from faster_whisper import WhisperModel
+        mpath = resolve_model(args.model)
+        cached = os.path.isdir(mpath)
+        print(f"[載入] faster-whisper '{args.model}'"
+              + ("（使用本機快取，不連網）" if cached else "（首次會下載模型）"))
+        model = WhisperModel(mpath, device="cpu", compute_type="int8")
 
-    hint = " ".join(clean_lines[:8])[:600]
-    print(f"[轉寫] language={args.language}，每 {args.chunk:.0f}s 一段、重疊 {args.overlap:.0f}s")
-    segs = transcribe_chunked(model, audio, args.language, hint,
-                              chunk=args.chunk, overlap=args.overlap,
-                              nst=args.no_speech_threshold)
-    print(f"[轉寫] 共取得 {len(segs)} 段，覆蓋 {segs[0]['start']:.1f}s → {segs[-1]['end']:.1f}s"
-          if segs else "[轉寫] 沒有取得任何段落！")
+        audio = load_audio_16k(args.audio)
+        dur = len(audio) / TARGET_SR      # 用實際樣本數，不信 sf.info 的估計值
+        print(f"[解碼] {dur:.1f}s @ {TARGET_SR}Hz（已繞開 faster-whisper 的 PyAV 呼叫）")
+
+        hint = (" ".join(clean_lines[:8])[:600] if args.hint == "auto"
+                else args.hint)
+        print(f"[轉寫] language={args.language}，每 {args.chunk:.0f}s 一段、"
+              f"重疊 {args.overlap:.0f}s")
+        segs = transcribe_chunked(model, audio, args.language, hint,
+                                  chunk=args.chunk, overlap=args.overlap,
+                                  nst=args.no_speech_threshold,
+                                  retry=args.retry_chunk, gap=args.gap,
+                                  filter_junk=not args.allow_junk)
+        print(f"[轉寫] 共取得 {len(segs)} 段，"
+              f"覆蓋 {segs[0]['start']:.1f}s → {segs[-1]['end']:.1f}s"
+              if segs else "[轉寫] 沒有取得任何段落！")
+
+        try:                            # 存原始段落，方便離線重跑 attach
+            with open(segs_path, "w", encoding="utf-8") as f:
+                json.dump({"audio": os.path.basename(args.audio),
+                           "duration": round(dur, 3), "segments": segs},
+                          f, ensure_ascii=False)
+        except OSError:
+            pass
 
     # 存一份 ASR 逐字稿，事後要查「Whisper 到底聽到什麼」才不用重跑
     asr_path = os.path.splitext(args.output)[0] + ".asr.txt"
@@ -431,7 +667,9 @@ def main():
     except OSError:
         pass
 
-    mapped = attach(raw_lines, clean_lines, segs)
+    mapped = attach(raw_lines, clean_lines, segs,
+                    min_cover=args.min_cover, lookahead=args.lookahead,
+                    max_gap=args.max_gap, earliest=not args.prefer_best)
 
     lines = [{
         "text": m["text"],

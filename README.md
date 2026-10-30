@@ -28,10 +28,14 @@ lrc-workflow/
 │       ├── Draw-the-Line.kugou.lrc       酷狗/QQ 版
 │       ├── Draw-the-Line.kugou.word.lrc  酷狗/QQ 逐字版
 │       ├── Draw-the-Line.lyrics.txt      當初對齊用的那版歌詞（留存，方便對照）
+│       ├── Draw-the-Line.words.segs.json 原始 ASR 段落（調參時可沿用，不用重聽）
+│       ├── Draw-the-Line.words.asr.txt   Whisper 實際聽到的逐字稿（查錯用）
 │       └── align.log                     對齊過程紀錄
 ├── align_local.py              對齊（本機 CPU 路線，不需 torch）
 ├── json2lrc.py                 words.json → .lrc
 ├── qc.py                       品檢
+├── probe.py                    單一區間診斷（那段到底有沒有唱？）
+├── diff_asr.py                 ASR 逐字稿 vs 歌詞，分辨「歌詞版本不對」還是「漏聽」
 ├── run.sh                      一首歌，一鍵跑完
 ├── batch.sh                    整張專輯批次跑
 └── setup.sh                    建立環境（只需跑一次）
@@ -203,6 +207,12 @@ Suno 產歌 → 下載人聲分軌 WAV
 7. **整首歌一次餵給 Whisper 會中途崩塌。** faster-whisper 在 `no_speech_prob > 門檻` 且 logprob 偏低時會 **fast-forward 直接跳掉整段**；唱歌的 `no_speech_prob` 常常 0.8~0.9（它的語音檢測頭是為說話訓練的），一旦長時間解碼讓 logprob 劣化，後半首就整片蒸發。實測一首 333 秒的歌只轉出 16 段、後面 160 秒全空，但把同一段音訊單獨切出來轉寫卻內容豐富。**解法：切成 60 秒一段獨立解碼**（`--chunk`），並關掉 `condition_on_previous_text`、把 `no_speech_threshold` 放寬到 0.85。
 8. **faster-whisper 每次都會先連 HuggingFace 查 repo_info，即使模型早已在硬碟裡。** 在中國大陸很容易撞到代理 503。`align_local.py` 會先找本機快取、直接丟路徑給它，第二次起完全不連網。
 9. **判斷對齊好壞的唯一指標是「插值行比例」。** 每次跑完會存一份 `<歌名>.asr.txt`（Whisper 實際聽到的逐字稿），對齊崩掉時開來看一眼就知道是 Whisper 沒聽到，還是歌詞文本跟實際唱的不一樣。
+10. **Whisper 會幻覺出 YouTube 片尾字幕。** 它是在大量影片音軌上訓練的，遇到聽不懂的音樂不會留白，而是很自信地吐出 `"Thanks for watching."` / `"I hope you enjoyed the video."` / `"www.github.com"`。這些假段落會**搶走真歌詞的時間軸**——實測 `Wild Little Detours` 被一句幻覺佔掉 8.4~26.0s，害主歌一整段全變插值。`align_local.py` 內建片語黑名單 + 稀疏檢查（很長的段落卻只有幾個字）自動丟掉，並把那段拿去用小切片重轉。要關掉請加 `--allow-junk`。
+11. **別把歌詞當 `initial_prompt` 餵進去。** 直覺上「先給它看歌詞應該更準」，實測反而是災難：遇到沒聽懂的段落，Whisper 直接把提示詞當回音吐出來（`'Youknowthewayofcourse'`、`'Morningsunanopenroad'`），污染後面的序列比對。`align_local.py` 預設**不帶提示詞**；想試請加 `--hint auto`。
+12. **不要用整份歌詞對整份 ASR 做一次全域比對。** 副歌會重複好幾次，全域 LCS 一旦某一行配錯（實測 `"Feels a little right with you"` 配到第三段副歌去），後面十幾行就統統沒得配、全部掉進插值。改成**依序錨定**：照歌詞行的順序往後找，找到就把游標推進，時間軸永遠往前、也一定先用最近的那一次。
+13. **光是「依序」還不夠，搜尋還要設時間上限。** 只做單向推進的話，`"Here we go again!"` 會因為跟後面 `"Here we go tonight"` 只差幾個字，一口氣往前跳 43 秒，把中間十幾行全部鎖死在門外。`--max-gap`（預設 30 秒）限制每行只能配到「上一行結束 + N 秒」之前。實測 `Wild Little Detours` 的健康度：無上限 36 → 設 30 秒 84。
+14. **候選要挑「最早能用的」，不要挑「配得最完美的」。** 唱歌是有順序的，後面那次副歌配得再漂亮也不是這一行。改成「找到第一個覆蓋率達標的候選就採用」之後，`Wild Little Detours` 的插值行從 6 降到 **2**，健康度 84 → **90**。要換回舊行為請加 `--prefer-best`。
+15. **很長的段落卻轉不出東西，不代表那段沒唱。** 實測 `Wild Little Detours` 主歌一在 30 秒分段裡完全靜默，但切成 4 秒一片就聽得出 `"Morning sun and open road"`。`--gap` 會自動偵測覆蓋不到的時間洞（含開頭與結尾）並用 `--retry-chunk` 的小切片補，預設開著。
 
 ### 速度參考（i5-1030NG7 @1.1GHz / 8GB / CPU int8）
 
@@ -240,6 +250,50 @@ python3 diff_asr.py output/<歌名>/<歌名>.words.asr.txt input/<歌名>_lyrics
   縮小 `--chunk`（預設 60，可試 30）再跑一次通常能救回來。
 - **「對不上」的錯字**（例如 detours↔details）——那只是 Whisper 聽錯，
   不影響歌詞，因為我們永遠輸出你給的文字。
+
+### 只想查某一段：用 `probe.py`
+
+懷疑某個時間區間對不上時，不必重跑整首。把那段挖出來單獨轉寫，
+順便印出每秒能量，就能分辨「Whisper 漏聽」跟「那段本來就沒唱」：
+
+```bash
+.venv/bin/python probe.py input/Wild-Little-Detours.mp3 4 36 --language en
+.venv/bin/python probe.py input/Wild-Little-Detours.mp3 4 36 --language en --step 4
+```
+
+直接轉 32 秒通常只吐得出零碎兩三段；加 `--step 4` 切成 4 秒一片，
+常常整段歌詞就浮出來了——這正是 `--gap` / `--retry-chunk` 自動在做的事。
+
+### 調參不想重聽：`--segs-in`
+
+轉寫是最慢的一步（一首 3.5 分鐘的歌約 10 分鐘）。每次跑完會把原始 ASR 段落
+存成 `<歌名>.segs.json`，之後要調映射參數直接沿用，幾秒就有結果：
+
+```bash
+.venv/bin/python align_local.py input/歌.mp3 input/歌詞.txt \
+  -o output/歌/歌.words.json --segs-in output/歌/歌.segs.json \
+  --min-cover 0.3 --max-gap 20
+```
+
+參數敏感性（兩首歌交叉實測，插值行數）：
+
+| `--min-cover` | 0.4 | 0.45 | 0.5 | 0.55 | 0.6 | 0.7 |
+|---|---|---|---|---|---|---|
+| Wild Little Detours | **6** | 6 | 7 | 8 | 5 | 5 |
+| My Own Gravity | **2** | 8 | 12 | 16 | 18 | 22 |
+
+| `--max-gap` | 15 | 20 | 25 | **30** | 35 | 40 | 60 |
+|---|---|---|---|---|---|---|---|
+| Wild Little Detours | 6 | 6 | 6 | **6** | 6 | 31 | 38 |
+| My Own Gravity | 2 | 2 | 2 | **2** | 2 | 2 | 17 |
+
+兩個結論：
+
+- `--max-gap` 有一段穩定的高原（15~35 秒），預設取中間 30；一旦放太寬，
+  相似歌詞就會互相誘走，健康度直接腰斬。
+- `--min-cover` **寧可低不要高**。門檻拉到 0.6 對 `Wild Little Detours` 只多救回
+  1 行，對 `My Own Gravity` 卻從 2 行插值暴增到 18 行（健康度 90 → 65）。
+  轉寫跟歌詞的落差本來就大，設太嚴只會整首崩掉。
 
 ---
 

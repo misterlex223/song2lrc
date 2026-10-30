@@ -7,6 +7,8 @@
 #
 # 環境變數：
 #   MODEL=small          模型大小，tiny / base / small / medium
+#   CHUNK=30             分段秒數（預設 60；插值率偏高時試 30）
+#   RETRY=8              命中幻覺的時間段改用 8 秒小切片重轉（0 = 不重試）
 #   FORCE=1              已對齊過也重跑（預設會跳過，直接沿用 words.json）
 #
 # 產出全部集中在 output/<歌名>/：
@@ -34,6 +36,9 @@ MODEL="${MODEL:-small}"                  # tiny / base / small / medium
 LANG_CODE="${5:-${LANG_CODE:-zh}}"       # zh / en / yue，也可用第 5 個參數指定
 CHUNK="${CHUNK:-60}"                     # 分段秒數；插值率偏高時試 30
 NST="${NST:-0.85}"                       # no_speech_threshold；越大越不容易跳段
+RETRY="${RETRY:-4}"                      # 幻覺/空檔區間用小切片重試的秒數；0 = 不重試
+GAP="${GAP:-8}"                          # 段間空檔超過這個秒數就補洞
+OVERLAP="${OVERLAP:-4}"                  # 分段之間的重疊秒數（純供上下文）
 
 # 注意：bash 3.2 在 UTF-8 環境下會把緊跟在 $VAR 後面的全形字元
 # 當成變數名稱的一部分，所以變數一律用 ${...} 包起來。
@@ -47,7 +52,8 @@ else
   echo "       350 秒的歌在 CPU 上約需 17 分鐘，去泡杯咖啡"
   .venv/bin/python align_local.py "$AUDIO" "$LYRICS" \
     -o "$OUT/${BASE}.words.json" --model "$MODEL" --language "$LANG_CODE" \
-    --chunk "$CHUNK" --no-speech-threshold "$NST" \
+    --chunk "$CHUNK" --overlap "$OVERLAP" --no-speech-threshold "$NST" \
+    --retry-chunk "$RETRY" --gap "$GAP" \
     2>&1 | tee "$OUT/align.log"
 fi
 
